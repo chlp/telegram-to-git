@@ -139,6 +139,7 @@ func (b *Bot) folderName(chat *tgbotapi.Chat) (string, bool) {
 	}
 	// No channels configured → accept all, derive name from chat metadata.
 	if len(b.cfg.Channels) == 0 {
+		log.Printf("chat id=%d title=%q username=%q", chat.ID, chat.Title, chat.UserName)
 		name := sanitize(chat.UserName)
 		if name == "" {
 			name = sanitize(chat.Title)
