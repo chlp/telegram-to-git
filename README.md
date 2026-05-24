@@ -127,7 +127,93 @@ Run with different config files to archive several channels into different repos
 
 If `channels` is left empty the bot accepts messages from every chat it receives updates from — useful for initial testing.
 
-## Running as a service (macOS launchd)
+## Running as a service
+
+### Linux (Ubuntu / systemd)
+
+Install Go if not already present:
+
+```bash
+sudo apt update && sudo apt install -y golang-go git
+```
+
+Build and install the binary:
+
+```bash
+go build -o telegram-to-git .
+sudo mv telegram-to-git /usr/local/bin/
+```
+
+Create a dedicated user so the bot does not run as root:
+
+```bash
+sudo useradd -r -s /bin/false tg2git
+```
+
+Place your config file somewhere readable by that user, for example `/etc/telegram-to-git/config.yaml`, and set permissions:
+
+```bash
+sudo mkdir /etc/telegram-to-git
+sudo cp config.yaml /etc/telegram-to-git/config.yaml
+sudo chown -R tg2git:tg2git /etc/telegram-to-git
+sudo chmod 640 /etc/telegram-to-git/config.yaml
+```
+
+Make sure the target repository is also owned by `tg2git` (or cloned as that user):
+
+```bash
+sudo -u tg2git git clone git@github.com:you/your-notes.git /home/tg2git/notes
+# or for an existing repo:
+sudo chown -R tg2git:tg2git /path/to/repo
+```
+
+The bot pushes over SSH, so add a key for the `tg2git` user:
+
+```bash
+sudo -u tg2git ssh-keygen -t ed25519 -f /home/tg2git/.ssh/id_ed25519 -N ""
+# copy the public key to GitHub/GitLab → Settings → SSH keys:
+sudo cat /home/tg2git/.ssh/id_ed25519.pub
+```
+
+Create `/etc/systemd/system/telegram-to-git.service`:
+
+```ini
+[Unit]
+Description=Telegram to Git archiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tg2git
+ExecStart=/usr/local/bin/telegram-to-git --config /etc/telegram-to-git/config.yaml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-to-git
+sudo systemctl status telegram-to-git
+journalctl -u telegram-to-git -f   # follow logs
+```
+
+To run multiple instances (different channels / repos), create separate unit files:
+
+```bash
+# /etc/systemd/system/telegram-to-git-work.service
+ExecStart=/usr/local/bin/telegram-to-git --config /etc/telegram-to-git/work.yaml
+
+# /etc/systemd/system/telegram-to-git-personal.service
+ExecStart=/usr/local/bin/telegram-to-git --config /etc/telegram-to-git/personal.yaml
+```
+
+### macOS (launchd)
 
 Create `~/Library/LaunchAgents/com.telegram-to-git.plist`:
 
