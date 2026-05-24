@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,17 +19,17 @@ import (
 )
 
 type Config struct {
-	TelegramToken      string    `yaml:"telegram_token"`
-	Channels           []Channel `yaml:"channels"`
-	RepoPath           string    `yaml:"repo_path"`
-	GitBranch          string    `yaml:"git_branch"`
-	GitRemote          string    `yaml:"git_remote"`
-	GitAuthorName      string    `yaml:"git_author_name"`
-	GitAuthorEmail     string    `yaml:"git_author_email"`
-	MaxFileSizeMB      float64   `yaml:"max_file_size_mb"`
-	CommitDelayMin     float64   `yaml:"commit_delay_min"`
-	CommitMaxDelayMin  float64   `yaml:"commit_max_delay_min"`
-	Push               bool      `yaml:"push"`
+	TelegramToken     string    `yaml:"telegram_token"`
+	Channels          []Channel `yaml:"channels"`
+	RepoPath          string    `yaml:"repo_path"`
+	GitBranch         string    `yaml:"git_branch"`
+	GitRemote         string    `yaml:"git_remote"`
+	GitAuthorName     string    `yaml:"git_author_name"`
+	GitAuthorEmail    string    `yaml:"git_author_email"`
+	MaxFileSizeMB     float64   `yaml:"max_file_size_mb"`
+	CommitDelayMin    float64   `yaml:"commit_delay_min"`
+	CommitMaxDelayMin float64   `yaml:"commit_max_delay_min"`
+	Push              bool      `yaml:"push"`
 }
 
 type Channel struct {
@@ -41,12 +42,15 @@ type Bot struct {
 	cfg        *Config
 	api        *tgbotapi.BotAPI
 	mu         sync.Mutex // protects timer, hasDirty, firstDirty
-	syncMu     sync.Mutex // serializes gitSync calls
+	syncMu     sync.Mutex // serialises gitSync calls
 	timer      *time.Timer
 	hasDirty   bool
 	firstDirty time.Time
 	known      map[int64]string // chat ID -> folder name
 }
+
+// editTagRe matches " edit:HH:MM:SS" inside a message header.
+var editTagRe = regexp.MustCompile(` edit:\d{2}:\d{2}:\d{2}`)
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -86,11 +90,7 @@ func main() {
 	log.Printf("authorized as @%s", api.Self.UserName)
 	log.Printf("commit delay: %.0f min, max: %.0f min", cfg.CommitDelayMin, cfg.CommitMaxDelayMin)
 
-	b := &Bot{
-		cfg:   &cfg,
-		api:   api,
-		known: make(map[int64]string),
-	}
+	b := &Bot{cfg: &cfg, api: api, known: make(map[int64]string)}
 	for _, ch := range cfg.Channels {
 		if ch.ID != 0 && ch.Name != "" {
 			b.known[ch.ID] = ch.Name
@@ -102,13 +102,13 @@ func main() {
 	for update := range api.GetUpdatesChan(u) {
 		switch {
 		case update.Message != nil:
-			b.handleMessage(update.Message, false)
+			b.handleNew(update.Message)
 		case update.ChannelPost != nil:
-			b.handleMessage(update.ChannelPost, false)
+			b.handleNew(update.ChannelPost)
 		case update.EditedMessage != nil:
-			b.handleMessage(update.EditedMessage, true)
+			b.handleEdit(update.EditedMessage)
 		case update.EditedChannelPost != nil:
-			b.handleMessage(update.EditedChannelPost, true)
+			b.handleEdit(update.EditedChannelPost)
 		}
 	}
 }
@@ -137,7 +137,7 @@ func (b *Bot) folderName(chat *tgbotapi.Chat) (string, bool) {
 			return ch.Name, true
 		}
 	}
-	// No channels configured → accept all, derive name from chat metadata
+	// No channels configured → accept all, derive name from chat metadata.
 	if len(b.cfg.Channels) == 0 {
 		name := sanitize(chat.UserName)
 		if name == "" {
@@ -165,20 +165,24 @@ func sanitize(s string) string {
 	return sb.String()
 }
 
-func (b *Bot) handleMessage(msg *tgbotapi.Message, edited bool) {
+// handleNew records a new incoming message.
+//
+// Line format:
+//
+//	[YYYY-MM-DD HH:MM:SS #ID] @sender: content
+func (b *Bot) handleNew(msg *tgbotapi.Message) {
 	folder, ok := b.folderName(msg.Chat)
 	if !ok {
 		return
 	}
 
 	ts := time.Unix(int64(msg.Date), 0).UTC()
-	if edited && msg.EditDate != 0 {
-		ts = time.Unix(int64(msg.EditDate), 0).UTC()
+	year, date, tsStr := ts.Format("2006"), ts.Format("2006-01-02"), ts.Format("2006-01-02 15:04:05")
+
+	content := b.contentFromMessage(msg, folder, year, date)
+	if content == "" {
+		return
 	}
-	year := ts.Format("2006")
-	date := ts.Format("2006-01-02")
-	tsStr := ts.Format("2006-01-02 15:04:05")
-	sender := senderStr(msg.From)
 
 	dirPath := filepath.Join(b.cfg.RepoPath, "telegram", folder, year)
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
@@ -186,126 +190,178 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message, edited bool) {
 		return
 	}
 
-	prefix := ""
-	if edited {
-		prefix = "[edited] "
-	}
-
-	var entry string
-	switch {
-	case msg.Text != "":
-		entry = fmt.Sprintf("[%s] %s: %s%s", tsStr, sender, prefix, msg.Text)
-
-	case msg.Photo != nil:
-		photo := msg.Photo[len(msg.Photo)-1]
-		media := b.saveMedia(folder, year, date, "Photo", "jpg", photo.FileID, int64(photo.FileSize))
-		entry = fmt.Sprintf("[%s] %s: %s%s%s", tsStr, sender, prefix, media, captionSuffix(msg.Caption))
-
-	case msg.Video != nil:
-		v := msg.Video
-		media := b.saveMedia(folder, year, date, "Video", extFromMime(v.MimeType, "mp4"), v.FileID, int64(v.FileSize))
-		entry = fmt.Sprintf("[%s] %s: %s%s%s", tsStr, sender, prefix, media, captionSuffix(msg.Caption))
-
-	case msg.Document != nil:
-		d := msg.Document
-		ext := fileExt(d.FileName, extFromMime(d.MimeType, "bin"))
-		media := b.saveMedia(folder, year, date, "Document", ext, d.FileID, int64(d.FileSize))
-		entry = fmt.Sprintf("[%s] %s: %s%s%s", tsStr, sender, prefix, media, captionSuffix(msg.Caption))
-
-	case msg.Audio != nil:
-		a := msg.Audio
-		media := b.saveMedia(folder, year, date, "Audio", extFromMime(a.MimeType, "mp3"), a.FileID, int64(a.FileSize))
-		entry = fmt.Sprintf("[%s] %s: %s%s", tsStr, sender, prefix, media)
-
-	case msg.Voice != nil:
-		media := b.saveMedia(folder, year, date, "Voice", "ogg", msg.Voice.FileID, int64(msg.Voice.FileSize))
-		entry = fmt.Sprintf("[%s] %s: %s%s", tsStr, sender, prefix, media)
-
-	case msg.VideoNote != nil:
-		media := b.saveMedia(folder, year, date, "VideoNote", "mp4", msg.VideoNote.FileID, int64(msg.VideoNote.FileSize))
-		entry = fmt.Sprintf("[%s] %s: %s%s", tsStr, sender, prefix, media)
-
-	case msg.Sticker != nil:
-		s := msg.Sticker
-		emoji := ""
-		if s.Emoji != "" {
-			emoji = s.Emoji + " "
-		}
-		media := b.saveMedia(folder, year, date, "Sticker", "webp", s.FileID, int64(s.FileSize))
-		entry = fmt.Sprintf("[%s] %s: %s%s%s", tsStr, sender, prefix, emoji, media)
-
-	default:
-		return
-	}
-
+	line := fmt.Sprintf("[%s #%d] %s: %s", tsStr, msg.MessageID, senderStr(msg.From), content)
 	txtFile := filepath.Join(dirPath, date+".txt")
 	f, err := os.OpenFile(txtFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Printf("open %s: %v", txtFile, err)
 		return
 	}
-	_, werr := fmt.Fprintln(f, entry)
+	_, werr := fmt.Fprintln(f, line)
 	f.Close()
 	if werr != nil {
-		log.Printf("write %s: %v", txtFile, werr)
+		log.Printf("write: %v", werr)
 		return
 	}
 
+	if err := b.indexAdd(folder, msg.MessageID, date); err != nil {
+		log.Printf("index add: %v", err)
+	}
 	b.scheduleCommit()
 }
 
-// scheduleCommit arranges a git commit+push with two-tier delay:
-//   - reset delay timer (CommitDelayMin) on each new event
-//   - never wait more than CommitMaxDelayMin since first pending change
-func (b *Bot) scheduleCommit() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	now := time.Now()
-	delay := time.Duration(float64(time.Minute) * b.cfg.CommitDelayMin)
-	maxDelay := time.Duration(float64(time.Minute) * b.cfg.CommitMaxDelayMin)
-
-	if !b.hasDirty {
-		b.hasDirty = true
-		b.firstDirty = now
-	}
-
-	elapsed := now.Sub(b.firstDirty)
-	if elapsed >= maxDelay {
-		// Max wait exceeded — push right away and start a new cycle
-		if b.timer != nil {
-			b.timer.Stop()
-			b.timer = nil
-		}
-		b.hasDirty = false
-		go func() {
-			b.syncMu.Lock()
-			defer b.syncMu.Unlock()
-			b.gitSync()
-		}()
+// handleEdit updates an existing message line in-place.
+// The header gains an "edit:HH:MM:SS" tag; the content is replaced with the new text.
+// Full change history is available via git log -p.
+func (b *Bot) handleEdit(msg *tgbotapi.Message) {
+	folder, ok := b.folderName(msg.Chat)
+	if !ok {
 		return
 	}
 
-	// Remaining time before max deadline
-	remaining := maxDelay - elapsed
-	d := delay
-	if d > remaining {
-		d = remaining
+	editTs := time.Unix(int64(msg.EditDate), 0).UTC()
+	editTime := editTs.Format("15:04:05")
+
+	// Find the file that holds the original message (may be a different day).
+	origDate, found := b.indexLookup(folder, msg.MessageID)
+	if !found {
+		// Fallback: assume same day as the message timestamp.
+		origDate = time.Unix(int64(msg.Date), 0).UTC().Format("2006-01-02")
+	}
+	year := origDate[:4]
+
+	content := b.contentFromMessage(msg, folder, year, origDate)
+	if content == "" {
+		return
 	}
 
-	if b.timer != nil {
-		b.timer.Reset(d)
-	} else {
-		b.timer = time.AfterFunc(d, func() {
-			b.mu.Lock()
-			b.timer = nil
-			b.hasDirty = false
-			b.mu.Unlock()
-			b.syncMu.Lock()
-			defer b.syncMu.Unlock()
-			b.gitSync()
-		})
+	txtFile := filepath.Join(b.cfg.RepoPath, "telegram", folder, year, origDate+".txt")
+	idTag := fmt.Sprintf(" #%d]", msg.MessageID)
+
+	updated, err := replaceLine(txtFile,
+		func(line string) bool { return strings.Contains(line, idTag) },
+		func(line string) string {
+			// Line: "[TIMESTAMP #ID(optional edit:X)] sender: old_content"
+			closeBracket := strings.Index(line, "]")
+			if closeBracket < 0 {
+				return line
+			}
+			header := line[1:closeBracket] // between "[" and "]"
+			rest := ""
+			if len(line) > closeBracket+2 {
+				rest = line[closeBracket+2:] // after "] "
+			}
+			colonIdx := strings.Index(rest, ": ")
+			if colonIdx < 0 {
+				return line
+			}
+			sender := rest[:colonIdx]
+
+			// Replace any previous edit tag, append new one.
+			cleanHeader := editTagRe.ReplaceAllString(header, "")
+			return "[" + cleanHeader + " edit:" + editTime + "] " + sender + ": " + content
+		},
+	)
+	if err != nil {
+		log.Printf("update line in %s: %v", txtFile, err)
+		return
 	}
+	if !updated {
+		log.Printf("message #%d not found in %s", msg.MessageID, txtFile)
+	}
+	b.scheduleCommit()
+}
+
+// contentFromMessage returns a single-line text representation of the message content.
+// Newlines inside text are escaped as \n.
+func (b *Bot) contentFromMessage(msg *tgbotapi.Message, folder, year, date string) string {
+	switch {
+	case msg.Text != "":
+		return escNL(msg.Text)
+	case msg.Photo != nil:
+		photo := msg.Photo[len(msg.Photo)-1]
+		media := b.saveMedia(folder, year, date, "Photo", "jpg", photo.FileID, int64(photo.FileSize))
+		return media + captionSuffix(escNL(msg.Caption))
+	case msg.Video != nil:
+		v := msg.Video
+		media := b.saveMedia(folder, year, date, "Video", extFromMime(v.MimeType, "mp4"), v.FileID, int64(v.FileSize))
+		return media + captionSuffix(escNL(msg.Caption))
+	case msg.Document != nil:
+		d := msg.Document
+		ext := fileExt(d.FileName, extFromMime(d.MimeType, "bin"))
+		media := b.saveMedia(folder, year, date, "Document", ext, d.FileID, int64(d.FileSize))
+		return media + captionSuffix(escNL(msg.Caption))
+	case msg.Audio != nil:
+		a := msg.Audio
+		return b.saveMedia(folder, year, date, "Audio", extFromMime(a.MimeType, "mp3"), a.FileID, int64(a.FileSize))
+	case msg.Voice != nil:
+		return b.saveMedia(folder, year, date, "Voice", "ogg", msg.Voice.FileID, int64(msg.Voice.FileSize))
+	case msg.VideoNote != nil:
+		return b.saveMedia(folder, year, date, "VideoNote", "mp4", msg.VideoNote.FileID, int64(msg.VideoNote.FileSize))
+	case msg.Sticker != nil:
+		s := msg.Sticker
+		emoji := ""
+		if s.Emoji != "" {
+			emoji = s.Emoji + " "
+		}
+		return emoji + b.saveMedia(folder, year, date, "Sticker", "webp", s.FileID, int64(s.FileSize))
+	}
+	return ""
+}
+
+// replaceLine reads a file, transforms the first line matching match(), and writes it back.
+func replaceLine(path string, match func(string) bool, transform func(string) string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		if match(line) {
+			lines[i] = transform(line)
+			return true, os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+		}
+	}
+	return false, nil
+}
+
+// Index file: telegram/{folder}/.msgindex
+// Format: one line per message — "{msgID} {date}" (e.g. "12345 2025-05-24")
+// Used to find the day-file for cross-day edits.
+
+func (b *Bot) indexPath(folder string) string {
+	return filepath.Join(b.cfg.RepoPath, "telegram", folder, ".msgindex")
+}
+
+func (b *Bot) indexAdd(folder string, msgID int, date string) error {
+	dir := filepath.Join(b.cfg.RepoPath, "telegram", folder)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(b.indexPath(folder), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%d %s\n", msgID, date)
+	return err
+}
+
+func (b *Bot) indexLookup(folder string, msgID int) (string, bool) {
+	data, err := os.ReadFile(b.indexPath(folder))
+	if err != nil {
+		return "", false
+	}
+	prefix := fmt.Sprintf("%d ", msgID)
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix), true
+		}
+	}
+	return "", false
 }
 
 func (b *Bot) saveMedia(folder, year, date, kind, ext, fileID string, knownSize int64) string {
@@ -339,7 +395,7 @@ func (b *Bot) saveMedia(folder, year, date, kind, ext, fileID string, knownSize 
 	outPath := filepath.Join(mediaDir, fileName)
 	relPath := filepath.Join("telegram", folder, year, "media", fileName)
 
-	// Skip download if file already saved (e.g. edited message with same media)
+	// Idempotent: skip download if the file already exists (handles re-edits).
 	if _, err := os.Stat(outPath); err == nil {
 		return fmt.Sprintf("[%s: %s]", kind, relPath)
 	}
@@ -353,7 +409,6 @@ func (b *Bot) saveMedia(folder, year, date, kind, ext, fileID string, knownSize 
 
 	out, err := os.Create(outPath)
 	if err != nil {
-		log.Printf("create %s: %v", outPath, err)
 		return fmt.Sprintf("[%s: write failed]", kind)
 	}
 	defer out.Close()
@@ -363,8 +418,58 @@ func (b *Bot) saveMedia(folder, year, date, kind, ext, fileID string, knownSize 
 		log.Printf("write %s: %v", outPath, err)
 		return fmt.Sprintf("[%s: write failed]", kind)
 	}
-
 	return fmt.Sprintf("[%s: %s (%.1f MB)]", kind, relPath, float64(n)/1048576)
+}
+
+// scheduleCommit arranges a git commit+push with two-tier debounce:
+//   - delay timer resets on each new event (CommitDelayMin)
+//   - hard deadline from first pending change (CommitMaxDelayMin)
+func (b *Bot) scheduleCommit() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+	delay := time.Duration(float64(time.Minute) * b.cfg.CommitDelayMin)
+	maxDelay := time.Duration(float64(time.Minute) * b.cfg.CommitMaxDelayMin)
+
+	if !b.hasDirty {
+		b.hasDirty = true
+		b.firstDirty = now
+	}
+
+	elapsed := now.Sub(b.firstDirty)
+	if elapsed >= maxDelay {
+		if b.timer != nil {
+			b.timer.Stop()
+			b.timer = nil
+		}
+		b.hasDirty = false
+		go func() {
+			b.syncMu.Lock()
+			defer b.syncMu.Unlock()
+			b.gitSync()
+		}()
+		return
+	}
+
+	remaining := maxDelay - elapsed
+	d := delay
+	if d > remaining {
+		d = remaining
+	}
+	if b.timer != nil {
+		b.timer.Reset(d)
+	} else {
+		b.timer = time.AfterFunc(d, func() {
+			b.mu.Lock()
+			b.timer = nil
+			b.hasDirty = false
+			b.mu.Unlock()
+			b.syncMu.Lock()
+			defer b.syncMu.Unlock()
+			b.gitSync()
+		})
+	}
 }
 
 func (b *Bot) gitSync() {
@@ -390,7 +495,6 @@ func (b *Bot) gitSync() {
 	if _, err := run("add", "-A"); err != nil {
 		return
 	}
-
 	status, _ := run("status", "--porcelain")
 	if strings.TrimSpace(status) == "" {
 		return
@@ -409,15 +513,12 @@ func (b *Bot) gitSync() {
 	if _, err := run("push", b.cfg.GitRemote, b.cfg.GitBranch); err == nil {
 		return
 	}
-
-	// Push failed — try pull --rebase, then push again
 	if _, err := run("pull", "--rebase", b.cfg.GitRemote, b.cfg.GitBranch); err != nil {
 		run("rebase", "--abort") //nolint:errcheck
 		log.Println("rebase failed, force pushing")
 		run("push", "--force", b.cfg.GitRemote, b.cfg.GitBranch) //nolint:errcheck
 		return
 	}
-
 	if _, err := run("push", b.cfg.GitRemote, b.cfg.GitBranch); err != nil {
 		log.Println("push failed after rebase, force pushing")
 		run("push", "--force", b.cfg.GitRemote, b.cfg.GitBranch) //nolint:errcheck
@@ -440,6 +541,10 @@ func captionSuffix(c string) string {
 		return ""
 	}
 	return " " + c
+}
+
+func escNL(s string) string {
+	return strings.ReplaceAll(s, "\n", `\n`)
 }
 
 func extFromMime(mime, fallback string) string {

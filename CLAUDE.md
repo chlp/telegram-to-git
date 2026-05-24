@@ -2,24 +2,70 @@
 
 ## What this is
 
-`telegram-to-git` is a single-binary Go service that listens to Telegram chats/channels via the Bot API and appends every message to daily `.txt` files in a git repository, committing and pushing on a configurable debounce schedule.
+`telegram-to-git` is a single-binary Go service that listens to Telegram chats/channels via the Bot API and saves every message to daily `.txt` files in a git repository, committing and pushing on a configurable debounce schedule.
+
+## File layout
+
+```
+telegram/
+  {channel-name}/
+    .msgindex            ← ID→date index for cross-day edit resolution
+    {year}/
+      {year}-{month}-{day}.txt
+      media/
+        {date}_{shortFileID}.{ext}
+```
+
+## Message format
+
+Each message occupies **exactly one line**:
+
+```
+[YYYY-MM-DD HH:MM:SS #ID] @sender: content
+```
+
+An edited message has an `edit:HH:MM:SS` tag added to (or updated in) the header — the content is replaced in-place:
+
+```
+[2025-05-24 14:30:00 #12345 edit:14:41:00] @username: corrected text
+```
+
+Rules:
+- Newlines inside message text are escaped as `\n` (literal backslash-n) to preserve the one-line invariant.
+- Media is referenced as `[Photo: telegram/chan/2025/media/file.jpg (1.2 MB)]`.
+- Files over the size limit are noted as `[Photo: 25.3 MB > 20 MB limit, skipped]`.
+- The full edit history is in `git log -p` — each commit shows exactly which line changed and how.
+
+## Index file (`.msgindex`)
+
+Plain text, one entry per line: `{msgID} {date}`.
+
+Used by `handleEdit` to find which day-file contains a given message ID (edits can arrive days after the original message). Appended on every `handleNew`; scanned linearly on `handleEdit`. For personal use (~50 msg/day) linear scan stays fast for years.
 
 ## Architecture
 
-Everything lives in `main.go` — no packages, no layers. Keep it that way unless the file grows past ~600 lines.
+Everything lives in `main.go` — no packages, no layers. Keep it that way unless the file grows past ~700 lines.
 
 Key types:
-- `Config` — parsed from YAML config file, one per running instance
-- `Channel` — a chat to monitor (by numeric ID or @username) with a folder `Name`
-- `Bot` — holds the Telegram API client, commit timer state, and a map of known chat IDs
+- `Config` — parsed from YAML; one per running process.
+- `Channel` — a chat to monitor (numeric ID or @username) with a folder `Name`.
+- `Bot` — Telegram API client, commit timer state, known chat ID map.
+
+### Edit handling (`handleEdit`)
+
+1. Look up original date in `.msgindex` (fallback: `msg.Date`).
+2. Read the day-file, find the line containing ` #ID]`.
+3. Strip any existing `edit:...` tag from the header, insert new one.
+4. Replace content after `sender: ` with the new text/media reference.
+5. Write the file back.
 
 ### Commit scheduling (`scheduleCommit`)
 
-Two-tier debounce to avoid excessive git operations:
-- `commit_delay_min` — timer resets on each new event (default 2 min)
-- `commit_max_delay_min` — hard deadline from first pending change (default 10 min)
+Two-tier debounce — avoids excessive git traffic from message bursts:
+- `CommitDelayMin`: resets on each new event.
+- `CommitMaxDelayMin`: hard deadline from first pending change.
 
-`syncMu` (a second mutex) serialises concurrent `gitSync` calls that can arise when the max-delay path fires a goroutine while the timer path is also active.
+`syncMu` serialises concurrent `gitSync` goroutines (the max-delay path can fire a goroutine while a timer-path goroutine is still running).
 
 ### Git conflict strategy (`gitSync`)
 
@@ -27,11 +73,10 @@ Two-tier debounce to avoid excessive git operations:
 2. `git push` → if fails: `git pull --rebase` → `git push`
 3. If rebase fails: `git rebase --abort` + `git push --force`
 
-The repo this writes to is the **user's notes repo**, not this source repo.
+## What Bot API cannot do
 
-## Config file
-
-`config.yaml` is gitignored (contains the bot token). Always work from `config.example.yaml` as the canonical reference. All fields have safe defaults — only `telegram_token` and `repo_path` are required.
+- **Deleted messages**: no deletion events are sent to bots. Would require a userbot (MTProto). Not implemented.
+- **Files > 20 MB**: hard Telegram limit for bot downloads regardless of `max_file_size_mb`.
 
 ## Building
 
@@ -39,19 +84,14 @@ The repo this writes to is the **user's notes repo**, not this source repo.
 go build -o telegram-to-git .
 ```
 
-No Makefile, no Docker, no build tags. `go mod tidy` if dependencies drift.
+No Makefile, no Docker. `go mod tidy` if dependencies drift.
 
 ## Running multiple instances
 
-Supported by design — pass `--config path/to/config.yaml`. Each instance is independent; they must point to different repos or at least different channel sets writing to non-overlapping paths.
-
-## What the Bot API cannot do
-
-- **Deleted messages**: the API sends no deletion events. Not implemented, not workaroundable without a userbot.
-- **Files > 20 MB**: Telegram hard-limits bot file downloads to 20 MB. Files above the limit are noted in the log as skipped, never downloaded.
+Pass `--config path/to/config.yaml`. Instances must write to different repos or non-overlapping channel paths to avoid git conflicts.
 
 ## Conventions
 
 - No comments unless the WHY is non-obvious.
-- No error wrapping with `fmt.Errorf("...: %w", ...)` — just log and return.
-- Media filenames: `{date}_{last12charsOfFileID}.{ext}` — deterministic enough to deduplicate on re-edits.
+- `escNL()` is called on all user-supplied text to keep the one-line-per-message invariant.
+- Media filenames are deterministic (`{date}_{last12ofFileID}.{ext}`) so `saveMedia` is idempotent and won't re-download on edit.
