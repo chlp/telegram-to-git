@@ -1,0 +1,37 @@
+# Telegram bot token from @BotFather
+telegram_token: "1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ"
+
+# Channels/groups/chats to monitor.
+# Leave empty to accept messages from all chats (useful for testing).
+channels:
+  - id: -1001234567890       # numeric chat ID (groups/channels have negative IDs)
+    name: "my-journal"        # folder name: telegram/my-journal/2025/2025-05-24.txt
+  - username: "@mychannel"    # public channel by username
+    name: "my-channel"
+  - id: 987654321             # private chat with a user
+    name: "notes"
+
+# Absolute path to the git repository where messages will be saved.
+repo_path: "/Users/me/Documents/my-notes-repo"
+
+# Git settings (branch is auto-detected from repo if omitted)
+git_branch: "main"
+git_remote: "origin"
+git_author_name: "Telegram Bot"
+git_author_email: "bot@telegram"
+
+# Media files: maximum size to download and commit.
+# Telegram Bot API can download files up to 20 MB; files larger than that
+# are inaccessible via bot API regardless of this setting.
+max_file_size_mb: 20
+
+# Commit timing: debounce pushes so quick message bursts are batched.
+# commit_delay_min  — reset wait timer after each new message (default: 2)
+# commit_max_delay_min — push regardless after this many minutes (default: 10)
+# Example: message at 12:00 → wait until 12:02. New message at 12:01 → wait
+# until 12:03. But if activity kept resetting since 12:00, push at 12:10 anyway.
+commit_delay_min: 2
+commit_max_delay_min: 10
+
+# Set to false to only commit locally without pushing (useful for local repos)
+push: true

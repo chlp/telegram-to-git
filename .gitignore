@@ -1,0 +1,26 @@
+# Binary and secrets
+telegram-to-git
+config.yaml
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# VS Code
+.vscode/
+
+# Go
+*.test
+*.out
