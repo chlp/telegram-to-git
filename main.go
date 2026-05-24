@@ -482,15 +482,20 @@ func (b *Bot) gitSync() {
 		"GIT_COMMITTER_EMAIL="+b.cfg.GitAuthorEmail,
 	)
 
-	run := func(args ...string) (string, error) {
+	execGit := func(args ...string) (string, error) {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir
 		cmd.Env = env
 		out, err := cmd.CombinedOutput()
-		if err != nil {
-			log.Printf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-		}
 		return string(out), err
+	}
+
+	run := func(args ...string) (string, error) {
+		out, err := execGit(args...)
+		if err != nil {
+			log.Printf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(out))
+		}
+		return out, err
 	}
 
 	if _, err := run("add", "-A"); err != nil {
@@ -511,19 +516,27 @@ func (b *Bot) gitSync() {
 		return
 	}
 
-	if _, err := run("push", b.cfg.GitRemote, b.cfg.GitBranch); err == nil {
+	if _, err := execGit("push", b.cfg.GitRemote, b.cfg.GitBranch); err == nil {
+		log.Println("pushed successfully")
 		return
 	}
+	log.Println("push rejected, pulling with rebase...")
 	if _, err := run("pull", "--rebase", b.cfg.GitRemote, b.cfg.GitBranch); err != nil {
 		run("rebase", "--abort") //nolint:errcheck
 		log.Println("rebase failed, force pushing")
-		run("push", "--force", b.cfg.GitRemote, b.cfg.GitBranch) //nolint:errcheck
+		if _, err := run("push", "--force", b.cfg.GitRemote, b.cfg.GitBranch); err == nil {
+			log.Println("pushed successfully")
+		}
 		return
 	}
-	if _, err := run("push", b.cfg.GitRemote, b.cfg.GitBranch); err != nil {
+	if _, err := execGit("push", b.cfg.GitRemote, b.cfg.GitBranch); err != nil {
 		log.Println("push failed after rebase, force pushing")
-		run("push", "--force", b.cfg.GitRemote, b.cfg.GitBranch) //nolint:errcheck
+		if _, err := run("push", "--force", b.cfg.GitRemote, b.cfg.GitBranch); err == nil {
+			log.Println("pushed successfully")
+		}
+		return
 	}
+	log.Println("pushed successfully")
 }
 
 func senderStr(u *tgbotapi.User) string {
